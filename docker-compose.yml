@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+
+  minio:
+    image: 'quay.io/minio/minio:latest'
+    hostname: minio
+    ports:
+      - '9000:9000'
+      - '9001:9001'
+    volumes:
+      - ./s3data/:/data
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    command: server /data --console-address ":9001"
+    container_name: s3-minio-cont
+    networks:
+      - go-resizer
+
+  go-resizer:
+    build:
+      context: ./go-resize-proxy
+      dockerfile: Dockerfile
+    container_name: go-resize-proxy
+    deploy:
+       resources:
+          limits:
+            cpus: "2"
+            memory: "1024M"
+    environment:
+      - S3_ADDR=http://minio:9000
+      - MALLOC_ARENA_MAX=2
+    ports:
+        - "8080:8080"
+    networks:
+        - go-resizer
+
+networks: 
+  go-resizer:
+

@@ -1,0 +1,61 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"os"
+)
+
+var (
+	PROXIED_SERVER = os.Getenv("S3_ADDR")
+)
+
+type transport struct {
+	http.RoundTripper
+}
+
+func (t *transport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
+	fmt.Println("go-proxy trying ... ", req.URL)
+
+	/* ** Modify request as required here ** */
+
+	// Complete the request via the proxy transport and get the response
+	resp, err = t.RoundTripper.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+
+	/* ** Modify response as required here ** */
+
+	fmt.Println("go-proxy serving response", resp.Status)
+	return resp, nil
+}
+
+func main() {
+
+	targetUrl, err := url.Parse(PROXIED_SERVER)
+	if err != nil {
+		return
+	}
+
+	// initialize a reverse proxy and pass the actual backend server url here
+	proxy := httputil.NewSingleHostReverseProxy(targetUrl)
+	proxy.Transport = &transport{http.DefaultTransport}
+	if err != nil {
+		panic(err)
+	}
+
+	// handle all requests to your server using the proxy
+	http.HandleFunc("/", ProxyRequestHandler(proxy))
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func ProxyRequestHandler(proxy *httputil.ReverseProxy) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Continue serving the request
+		proxy.ServeHTTP(w, r)
+	}
+}

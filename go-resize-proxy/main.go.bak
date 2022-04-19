@@ -1,0 +1,185 @@
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/h2non/bimg"
+	"go.uber.org/ratelimit"
+)
+
+var (
+	PROXIED_SERVER = os.Getenv("S3_ADDR")
+	S3_ADDRESS     = os.Getenv("S3_ADDR")
+)
+
+type transport struct {
+	http.RoundTripper
+}
+
+func (t *transport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
+	fmt.Println("inside go-proxy trying go-bimg-resize... ", req.URL)
+	var incomingUrl = req.URL.String()
+	var incomingUrlPath = req.URL.Path
+	var _position = strings.LastIndex(incomingUrl, "_")
+	if _position < 1 {
+		// if no width given assume no resize required and serve original file.
+		fmt.Println("inside go-proxy serving original file... ", req.URL)
+		return t.RoundTripper.RoundTrip(req)
+	}
+	var strippedUrl = incomingUrl[0:_position]
+	var widthPart = incomingUrl[_position+1 : len(incomingUrl)]
+	width, err := strconv.Atoi(widthPart)
+	if err != nil {
+		// handle error
+		fmt.Println(err)
+		return
+	}
+
+	targetUrl, err := url.Parse(strippedUrl)
+	if err != nil {
+		return
+	}
+	req.URL = targetUrl
+
+	fmt.Println("inside go-proxy fetching from strippedUrl... ", targetUrl)
+	resp, err = t.RoundTripper.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode == 200 {
+		resizeImageWithBimg(incomingUrlPath, resp, width)
+	}
+
+	fmt.Println("inside go-proxy  go-bimg-resize response", resp.Status)
+	return resp, nil
+}
+
+/*
+Resizes image using bimg libvips wrapper and uploads to s3.
+*/
+func resizeImageWithBimg(path string, resp *http.Response, width int) error {
+	b, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	err = resp.Body.Close()
+	if err != nil {
+		return err
+	}
+
+	origImage := bimg.NewImage(b)
+
+	// calculate relative height using aspect ratio
+	origSize, _ := origImage.Size()
+	heightCalculated := 0
+	if origSize.Width > origSize.Height {
+		aspectRatio := float64(origSize.Height / origSize.Width)
+		heightCalculated = int(float64(width) * aspectRatio)
+	} else {
+		aspectRatio := float64(origSize.Width / origSize.Height)
+		heightCalculated = int(float64(width) * aspectRatio)
+	}
+
+	newImage, err := origImage.Resize(width, heightCalculated)
+	// newImage, err := origImage.Thumbnail(width)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+	}
+
+	// Reset response body with new bytes[] after resizing for sending back to caller
+	resp.Body = ioutil.NopCloser(bytes.NewReader(newImage))
+	resp.Header["Content-Length"] = []string{fmt.Sprint(len(newImage))}
+
+	fmt.Println("inside go-proxy  go-bimg-resize done", resp.ContentLength, "bytes")
+	// fmt.Println(bimg.VipsVersion, bimg.VipsMemory())
+
+	// do a background upload to s3 without making the caller to wait
+	imageContentType := resp.Header.Get("Content-Type")
+	go func() {
+		fmt.Println("**", imageContentType)
+		// uncomment to enable upload, disabled for testing
+		// storage.Upload(path, newImage, imageContentType)
+	}()
+
+	return nil
+}
+
+var storage Storage
+var defaultRateLimiter ratelimit.Limiter
+var counter = uint64(0)
+
+func main() {
+
+	// Use uber ratelimiter library to throttle and queue requests. Since image processing is heavy on cpu
+	defaultRateLimiter = ratelimit.New(10) // per second
+
+	// set vips cache to 0 to avoid cgo wrapper (bimg) not releaseing memory to os.
+	// https://github.com/h2non/bimg/issues/241
+	bimg.VipsCacheSetMax(0)
+	bimg.VipsCacheSetMaxMem(0)
+
+	storage = NewS3Storage()
+
+	targetUrl, err := url.Parse(PROXIED_SERVER)
+	if err != nil {
+		return
+	}
+
+	// initialize a reverse proxy and pass the actual backend server url here
+
+	// ...
+	proxy := httputil.NewSingleHostReverseProxy(targetUrl)
+	proxy.Transport = &transport{http.DefaultTransport}
+	// proxy.Transport = &transport{t}
+	if err != nil {
+		panic(err)
+	}
+
+	// handle all requests to your server using the proxy
+	// http.HandleFunc("/", ProxyRequestHandler(proxy))
+	// handle all requests to your server using the proxy wrapped with a ratelimiter
+	http.HandleFunc("/", rateLimiterMiddleware(ProxyRequestHandler(proxy), defaultRateLimiter, counter))
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func ProxyRequestHandler(proxy *httputil.ReverseProxy) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Continue serving the request
+		proxy.ServeHTTP(w, r)
+	}
+}
+
+/*
+Below func just wraps our handlerfunc and makes use of uber-go ratelimiter to throttle requests handled per second.
+Used since image processing is a cpu & memory intensive process.
+#TODO remove counter for actual usage, counter is limited and only used for testing logs
+*/
+func rateLimiterMiddleware(h http.HandlerFunc, rl ratelimit.Limiter, counter uint64) func(w http.ResponseWriter, r *http.Request) {
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		//START: Rate limiter logic, use with timeout for best results
+		rl.Take() //Take will block the flow to make sure that the RPS is met.
+		// Following statements will only be executed once RPS is met.
+		counter = counter + 1
+		fmt.Println("*** inside go-proxy ratelimiter REQ#", counter)
+		select {
+		case <-r.Context().Done():
+			// Abort / return early
+			fmt.Println("inside go-proxy context cancelled... ")
+			return
+		default:
+		}
+		//END: Rate limiter logic
+		h.ServeHTTP(w, r)
+	})
+}
